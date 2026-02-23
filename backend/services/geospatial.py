@@ -19,9 +19,9 @@ from timezonefinder import TimezoneFinder
 from datetime import datetime
 import pytz
 
-from database import redis_client
-
 logger = logging.getLogger(__name__)
+
+_local_cache = {}
 
 DISTANCE_BANDS = {
     "green": 2_000,
@@ -43,7 +43,7 @@ ORS_API_KEY = os.getenv("ORS_API_KEY")
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 async def clear_cache():
-    await redis_client.flushdb()
+    _local_cache.clear()
 
 def _get_local_datetime(lat: float, lon: float) -> datetime:
     tf = TimezoneFinder()
@@ -162,10 +162,9 @@ def compute_unique_coverage(centres: List[dict], polygons_by_centre: Dict[str, D
 async def get_or_compute_polygons(centre: dict, mode: str) -> dict:
     cid = centre["id"]
     cache_key = f"poly:{cid}:{mode}"
-    cached = await redis_client.get(cache_key)
+    cached = _local_cache.get(cache_key)
     if cached:
-        data = json.loads(cached)
-        return {k: shape(v) for k, v in data.items()}
+        return {k: shape(v) for k, v in cached.items()}
     
     loop = asyncio.get_event_loop()
     if mode == "distance":
@@ -178,7 +177,7 @@ async def get_or_compute_polygons(centre: dict, mode: str) -> dict:
     
     if polys:
         cache_data = {k: v.__geo_interface__ for k, v in polys.items()}
-        await redis_client.set(cache_key, json.dumps(cache_data))
+        _local_cache[cache_key] = cache_data
     return polys
 
 async def compute_coverages(centres: List[dict]):

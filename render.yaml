@@ -11,11 +11,6 @@ services:
         fromDatabase:
           name: edi_db
           property: connectionString
-      - key: REDIS_URL
-        fromService:
-          type: redis
-          name: edi_redis
-          property: connectionString
       - key: ORS_API_KEY
         sync: false
       - key: PYTHON_VERSION
@@ -35,11 +30,6 @@ services:
         # e.g., https://edi-backend.onrender.com/api
       - key: NODE_VERSION
         value: "18.18.0"
-
-  # Managed Redis
-  - type: redis
-    name: edi_redis
-    ipAllowList: [] # Only allow internal network connections
 
 databases:
   # Managed PostgreSQL
