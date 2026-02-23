@@ -1,0 +1,48 @@
+services:
+  # Python Backend Service
+  - type: web
+    name: edi-backend
+    env: python
+    rootDir: backend
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: edi_db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: edi_redis
+          property: connectionString
+      - key: ORS_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.10.0"
+
+  # Next.js Frontend Service
+  - type: web
+    name: edi-frontend
+    env: node
+    rootDir: frontend
+    buildCommand: "npm install && npm run build"
+    startCommand: "npm run start"
+    envVars:
+      - key: NEXT_PUBLIC_API_URL
+        sync: false
+        # Note: Set this in the Render Dashboard to the backend's URL + '/api'
+        # e.g., https://edi-backend.onrender.com/api
+      - key: NODE_VERSION
+        value: "18.18.0"
+
+  # Managed Redis
+  - type: redis
+    name: edi_redis
+    ipAllowList: [] # Only allow internal network connections
+
+databases:
+  # Managed PostgreSQL
+  - name: edi_db
+    databaseName: edi
+    user: edi_user
