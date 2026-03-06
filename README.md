@@ -49,3 +49,4 @@ The root directory contains a `.env.example` file. Copy it to `.env` and fill in
 ```bash
 cp .env.example .env
 ```
+test
