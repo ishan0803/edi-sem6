@@ -13,3 +13,14 @@ requests>=2.31.0
 timezonefinder>=6.2.0
 scipy>=1.10.0
 pytz>=2023.3
+# --- Quick Commerce Logistics Engine additions ---
+spacy>=3.7.0
+openrouteservice>=2.3.3
+ortools>=9.8
+pandas>=2.1.0
+torch>=2.1.0
+torch_geometric>=2.4.0
+aiofiles>=23.2.1
+python-multipart>=0.0.6
+redis>=5.0.0
+geohash2>=1.1

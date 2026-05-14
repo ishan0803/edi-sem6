@@ -2,12 +2,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from database import engine, Base
 import routers.centres
+import routers.dispatch
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Fulfillment Centre Coverage API")
+app = FastAPI(title="Quick Commerce Logistics Engine")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,6 +30,7 @@ async def shutdown():
 
 # Include feature routers
 app.include_router(routers.centres.router, prefix="/api/centres", tags=["Centres"])
+app.include_router(routers.dispatch.router, prefix="/api", tags=["Dispatch & Logistics"])
 
 @app.get("/api/health")
 async def health_check():

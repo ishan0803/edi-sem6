@@ -1,7 +1,7 @@
 "use client";
 import { motion, useScroll, useTransform } from "framer-motion";
 import Link from "next/link";
-import { ArrowRight, MapPin, Activity, ShieldAlert, Cpu, Globe2, Network } from "lucide-react";
+import { ArrowRight, MapPin, Activity, ShieldAlert, Cpu, Globe2, Network, Brain, Building2, Truck, BarChart3 } from "lucide-react";
 import { useRef } from "react";
 
 export default function Home() {
@@ -50,7 +50,7 @@ export default function Home() {
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
               <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500"></span>
             </span>
-            Geospatial Systems Active
+            3D Friction-Aware Logistics Active
           </motion.div>
 
           <motion.h1
@@ -69,8 +69,8 @@ export default function Home() {
             transition={{ duration: 0.8, delay: 0.2, ease: "easeOut" }}
             className="text-lg md:text-xl text-gray-400 max-w-2xl mb-12 font-light tracking-wide leading-relaxed"
           >
-            A production-grade geospatial engine for analyzing multi-location service areas.
-            Track, optimize, and compute real-time distance and time-based isochrones with millimeter precision.
+            A 3D friction-aware quick commerce logistics engine meeting 10-minute SLAs.
+            NLP address parsing, elevator delays, city-tier traffic, and GNN inventory rebalancing.
           </motion.p>
 
           <motion.div
@@ -88,9 +88,13 @@ export default function Home() {
                 Launch Engine <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
               </span>
             </Link>
-            <button className="px-8 py-5 glass-panel text-white font-medium hover:bg-white/[0.05] transition-all border-white/10 hover:border-white/20">
-              View Architecture Docs
-            </button>
+            <Link
+              href="/inventory"
+              className="px-8 py-5 glass-panel text-white font-medium hover:bg-white/[0.05] transition-all border-white/10 hover:border-white/20 flex items-center gap-2"
+            >
+              <BarChart3 className="w-5 h-5 text-purple-400" />
+              Inventory Portal
+            </Link>
           </motion.div>
         </motion.div>
 
@@ -116,46 +120,28 @@ export default function Home() {
           className="text-center mb-24"
         >
           <h2 className="text-4xl md:text-5xl font-bold mb-4">Architected for <span className="text-blue-400">Scale</span></h2>
-          <p className="text-gray-400 max-w-2xl mx-auto text-lg">Heavy-duty computational geometry combined with distributed processing.</p>
+          <p className="text-gray-400 max-w-2xl mx-auto text-lg">Heavy-duty computational geometry combined with NLP, GNN, and VRP optimization.</p>
         </motion.div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
-          <FeatureCard
-            icon={<MapPin className="text-blue-400 w-6 h-6" />}
-            title="Spatial Routing"
-            description="High-performance mapping using OpenStreetMap and NetworkX topologies. Calculate precise routes across millions of nodes."
-            delay={0}
-          />
-          <FeatureCard
-            icon={<Activity className="text-purple-400 w-6 h-6" />}
-            title="Live Traffic Multipliers"
-            description="Dynamic time-bands adjusted by localized traffic congestion metrics, shifting dynamically based on time-of-day."
-            delay={0.1}
-          />
-          <FeatureCard
-            icon={<ShieldAlert className="text-pink-400 w-6 h-6" />}
-            title="Conflict Resolution"
-            description="Automatic polygon differences calculation to yield unique coverage zones preventing overlapping fulfillment areas."
-            delay={0.2}
-          />
-          <FeatureCard
-            icon={<Cpu className="text-cyan-400 w-6 h-6" />}
-            title="Redis Geocaching"
-            description="Sub-millisecond latency for repeated spatial queries. Instantly fetch previously generated isochrone polygons."
-            delay={0.3}
-          />
-          <FeatureCard
-            icon={<Globe2 className="text-emerald-400 w-6 h-6" />}
-            title="Deck.gl Rendering"
-            description="WebGL powered data visualization capable of rendering 100,000+ spatial structures at 60 FPS without DOM overhead."
-            delay={0.4}
-          />
-          <FeatureCard
-            icon={<Network className="text-orange-400 w-6 h-6" />}
-            title="FastAPI PostGIS"
-            description="Asynchronous Python backend integrated tightly with PostgreSQL + PostGIS for lightning fast ST_Intersects operations."
-            delay={0.5}
-          />
+          <FeatureCard icon={<MapPin className="text-blue-400 w-6 h-6" />} title="Spatial Routing"
+            description="High-performance mapping using OpenStreetMap and NetworkX topologies. Calculate precise routes across millions of nodes." delay={0} />
+          <FeatureCard icon={<Brain className="text-yellow-400 w-6 h-6" />} title="NLP Address Parsing (SAP)"
+            description="spaCy-powered NLP extracts missing structural elements from messy Indian addresses. Calculates search-time penalties for riders." delay={0.05} />
+          <FeatureCard icon={<Building2 className="text-pink-400 w-6 h-6" />} title="Z-Axis Friction (ZAFI)"
+            description="Queries OSM building data to calculate elevator wait times and security gate delays. Redis-cached with geohash keys." delay={0.1} />
+          <FeatureCard icon={<Activity className="text-purple-400 w-6 h-6" />} title="City-Tier Traffic"
+            description="Dynamic scaling factors for Metro (1.0-1.2×) vs Tier-2/3 (0.5-0.7×) cities with automatic reverse geocoding." delay={0.15} />
+          <FeatureCard icon={<Truck className="text-emerald-400 w-6 h-6" />} title="VRP Optimizer"
+            description="OR-Tools Constraint Programming minimizes True Cost = Transit + SAP + ZAFI across configurable rider fleets with 10-min SLA." delay={0.2} />
+          <FeatureCard icon={<Cpu className="text-cyan-400 w-6 h-6" />} title="GNN Inventory Engine"
+            description="Graph Convolutional Network trained on synthetic demand data predicts stockouts and recommends inter-store inventory transfers." delay={0.25} />
+          <FeatureCard icon={<ShieldAlert className="text-orange-400 w-6 h-6" />} title="Conflict Resolution"
+            description="Automatic polygon differences calculation to yield unique coverage zones preventing overlapping fulfillment areas." delay={0.3} />
+          <FeatureCard icon={<Globe2 className="text-emerald-400 w-6 h-6" />} title="Deck.gl Rendering"
+            description="WebGL powered data visualization rendering coverage zones, VRP routes, and pin-to-ETA overlays at 60 FPS." delay={0.35} />
+          <FeatureCard icon={<Network className="text-blue-400 w-6 h-6" />} title="FastAPI PostGIS"
+            description="Asynchronous Python backend with ThreadPoolExecutor offloading for all heavy compute. Zero event-loop blocking." delay={0.4} />
         </div>
       </section>
 
@@ -166,7 +152,7 @@ export default function Home() {
             <div className="w-2 h-2 rounded-full bg-green-500" />
             Core Systems Operational
           </div>
-          <p>© {new Date().getFullYear()} Fulfillment Intelligence Engine. EDI Sem 6.</p>
+          <p>© {new Date().getFullYear()} Quick Commerce Logistics Engine. EDI Sem 6.</p>
         </div>
       </footer>
     </div>

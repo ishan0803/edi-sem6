@@ -22,6 +22,7 @@ import pytz
 logger = logging.getLogger(__name__)
 
 _local_cache = {}
+_graph_cache = {}
 
 DISTANCE_BANDS = {
     "green": 2_000,
@@ -44,6 +45,7 @@ executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 async def clear_cache():
     _local_cache.clear()
+    _graph_cache.clear()
 
 def _get_local_datetime(lat: float, lon: float) -> datetime:
     tf = TimezoneFinder()
@@ -67,8 +69,15 @@ def traffic_multiplier_local(lat: float, lon: float) -> float:
 
 # OSMNX Graph processing
 def fetch_graph(lat: float, lon: float) -> nx.MultiDiGraph:
+    key = (round(lat, 5), round(lon, 5))
+    if key in _graph_cache:
+        logger.info(f"Graph cache hit for {key}")
+        return _graph_cache[key]
+    logger.info(f"Graph cache miss for {key}, downloading from Overpass...")
     G = ox.graph_from_point((lat, lon), dist=BUFFER_DIST_M, network_type=NETWORK_TYPE)
-    return ox.project_graph(G)
+    projected = ox.project_graph(G)
+    _graph_cache[key] = projected
+    return projected
 
 def nearest_node(G: nx.MultiDiGraph, lat: float, lon: float) -> int:
     gdf_nodes = ox.graph_to_gdfs(G, edges=False)
