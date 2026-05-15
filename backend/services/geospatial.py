@@ -43,9 +43,18 @@ ORS_API_KEY = os.getenv("ORS_API_KEY")
 
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
-async def clear_cache():
+async def clear_cache(db=None, centre_id: str = None):
+    """Clear in-memory cache. If db provided, also clear persisted coverage."""
     _local_cache.clear()
     _graph_cache.clear()
+    if db:
+        from sqlalchemy import delete as sa_delete
+        from models import CoverageCache
+        if centre_id:
+            await db.execute(sa_delete(CoverageCache).where(CoverageCache.centre_id == centre_id))
+        else:
+            await db.execute(sa_delete(CoverageCache))
+        await db.commit()
 
 def _get_local_datetime(lat: float, lon: float) -> datetime:
     tf = TimezoneFinder()
@@ -113,6 +122,7 @@ def build_distance_polygons(lat: float, lon: float) -> dict:
     return polygons
 
 def build_time_polygons_ors(lat: float, lon: float, api_key: str, tod_multiplier: float) -> dict:
+    from services.ors_limiter import ors_isochrones
     MAX_EFFECTIVE_SEC = {"green": 300, "blue": 450, "red": 600}
     scaled = {}
     for color, minutes in TIME_BANDS_MIN.items():
@@ -121,28 +131,19 @@ def build_time_polygons_ors(lat: float, lon: float, api_key: str, tod_multiplier
         scaled[color] = int(max(60, min(effective_sec, MAX_EFFECTIVE_SEC[color])))
 
     unique_ranges = sorted(set(scaled.values()), reverse=True)
-    payload = {
-        "locations": [[lon, lat]],
-        "range": unique_ranges,
-        "range_type": "time",
-        "smoothing": 0.1,
-        "area_units": "m",
-        "units": "m",
-    }
-    resp = requests.post(
-        ORS_ISOCHRONE_URL,
-        json=payload,
-        headers={"Authorization": api_key, "Content-Type": "application/json"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    raw = {feat["properties"]["value"]: shape(feat["geometry"]) for feat in resp.json().get("features", [])}
-    
+    raw = ors_isochrones(lon, lat, unique_ranges, api_key)
+    if not raw:
+        return {}
+
     polygons = {}
     for color, sec in scaled.items():
         if raw.keys():
             best_key = min(raw.keys(), key=lambda k: abs(k - sec))
-            polygons[color] = raw[best_key]
+            poly = raw[best_key]
+            # If it came from cache it's a dict (GeoJSON), convert to shapely
+            if isinstance(poly, dict):
+                poly = shape(poly)
+            polygons[color] = poly
     return polygons
 
 def compute_unique_coverage(centres: List[dict], polygons_by_centre: Dict[str, Dict[str, object]]) -> Dict[str, Dict[str, object]]:
@@ -168,13 +169,40 @@ def compute_unique_coverage(centres: List[dict], polygons_by_centre: Dict[str, D
                 unique[cid][band] = unique_polygon
     return unique
 
-async def get_or_compute_polygons(centre: dict, mode: str) -> dict:
+async def get_or_compute_polygons(centre: dict, mode: str, db=None) -> dict:
+    """Load polygons from memory cache → DB cache → fresh compute."""
     cid = centre["id"]
     cache_key = f"poly:{cid}:{mode}"
+
+    # 1. Check in-memory cache
     cached = _local_cache.get(cache_key)
     if cached:
         return {k: shape(v) for k, v in cached.items()}
-    
+
+    # 2. Check DB cache
+    if db:
+        from sqlalchemy import select as sa_select
+        from models import CoverageCache
+        result = await db.execute(
+            sa_select(CoverageCache).where(
+                CoverageCache.centre_id == cid,
+                CoverageCache.mode == mode,
+            )
+        )
+        db_rows = result.scalars().all()
+        if db_rows:
+            logger.info("Coverage DB cache HIT for %s/%s (%d bands)", cid, mode, len(db_rows))
+            polys = {}
+            cache_data = {}
+            for row in db_rows:
+                geo = json.loads(row.geojson)
+                polys[row.band] = shape(geo)
+                cache_data[row.band] = geo
+            _local_cache[cache_key] = cache_data
+            return polys
+
+    # 3. Fresh compute
+    logger.info("Coverage MISS for %s/%s — computing fresh", cid, mode)
     loop = asyncio.get_event_loop()
     if mode == "distance":
         polys = await loop.run_in_executor(executor, build_distance_polygons, centre["lat"], centre["lon"])
@@ -183,33 +211,46 @@ async def get_or_compute_polygons(centre: dict, mode: str) -> dict:
             return {}
         mult = traffic_multiplier_local(centre["lat"], centre["lon"])
         polys = await loop.run_in_executor(executor, build_time_polygons_ors, centre["lat"], centre["lon"], ORS_API_KEY, mult)
-    
+
+    # 4. Persist to memory + DB
     if polys:
         cache_data = {k: v.__geo_interface__ for k, v in polys.items()}
         _local_cache[cache_key] = cache_data
+        if db:
+            from models import CoverageCache
+            for band, geo in cache_data.items():
+                db.add(CoverageCache(
+                    centre_id=cid, mode=mode, band=band,
+                    geojson=json.dumps(geo),
+                ))
+            await db.commit()
+            logger.info("Coverage PERSISTED for %s/%s (%d bands)", cid, mode, len(cache_data))
     return polys
 
-async def compute_coverages(centres: List[dict]):
+async def compute_coverages(centres: List[dict], db=None):
     dist_polygons = {}
     time_polygons = {}
-    
-    for c in centres:
-        cdist = await get_or_compute_polygons(c, "distance")
-        ctime = await get_or_compute_polygons(c, "time")
+
+    for i, c in enumerate(centres):
+        cdist = await get_or_compute_polygons(c, "distance", db)
+        ctime = await get_or_compute_polygons(c, "time", db)
         if cdist: dist_polygons[c["id"]] = cdist
         if ctime: time_polygons[c["id"]] = ctime
-        
+        # Rate-limit: wait between centres to avoid ORS throttling
+        # (only needed when actually hitting ORS — skip if all cached)
+        if i < len(centres) - 1 and (not cdist or not ctime):
+            await asyncio.sleep(3.5)
+
     loop = asyncio.get_event_loop()
     unique_dist = await loop.run_in_executor(executor, compute_unique_coverage, centres, dist_polygons)
     unique_time = await loop.run_in_executor(executor, compute_unique_coverage, centres, time_polygons)
-    
+
     def serialize(unique_polys):
         res = {}
         for cid, bands in unique_polys.items():
             res[cid] = {b: poly.__geo_interface__ for b, poly in bands.items()}
         return res
-        
-    # Generate aggregate bounding boxes for the frontend to center the map easily
+
     return {
         "distance": serialize(unique_dist),
         "time": serialize(unique_time)

@@ -75,7 +75,7 @@ export const getCustomerETA = async (payload: CustomerETAPayload): Promise<Custo
     return response.data;
 };
 
-// ── Inventory / GNN API ──────────────────────────────────────────────────────
+// ── Synthetic GNN (legacy) ───────────────────────────────────────────────────
 
 export const trainSynthetic = async (): Promise<any> => {
     const response = await api.post('/inventory/train-synthetic');
@@ -89,5 +89,68 @@ export const getInventoryRecommendations = async (): Promise<any> => {
 
 export const getInventoryData = async (): Promise<any> => {
     const response = await api.get('/inventory/data');
+    return response.data;
+};
+
+// ── Custom SKU Catalogue ─────────────────────────────────────────────────────
+
+export interface SKU {
+    id: string;
+    name: string;
+    category: string;
+    unit_cost: number;
+}
+
+export const listSKUs = async (): Promise<SKU[]> => {
+    const response = await api.get('/skus');
+    return response.data;
+};
+
+export const createSKU = async (data: { id: string; name: string; category: string; unit_cost: number }): Promise<SKU> => {
+    const response = await api.post('/skus', data);
+    return response.data;
+};
+
+export const deleteSKU = async (skuId: string): Promise<void> => {
+    await api.delete(`/skus/${skuId}`);
+};
+
+// ── Real Hub Inventory ───────────────────────────────────────────────────────
+
+export interface StockItem {
+    id: number;
+    hub_id: string;
+    sku_id: string;
+    quantity: number;
+    hub_name?: string;
+    sku_name?: string;
+}
+
+export interface HubInventorySummary {
+    hub_id: string;
+    hub_name: string;
+    total_skus: number;
+    total_quantity: number;
+    items: StockItem[];
+}
+
+export const getAllInventory = async (): Promise<HubInventorySummary[]> => {
+    const response = await api.get('/inventory/all');
+    return response.data;
+};
+
+export const upsertStock = async (data: { hub_id: string; sku_id: string; quantity: number }): Promise<StockItem> => {
+    const response = await api.post('/inventory/stock', data);
+    return response.data;
+};
+
+export const deleteStock = async (recordId: number): Promise<void> => {
+    await api.delete(`/inventory/stock/${recordId}`);
+};
+
+// ── GNN Rebalance on Real Inventory ──────────────────────────────────────────
+
+export const rebalanceInventory = async (): Promise<any> => {
+    const response = await api.post('/inventory/rebalance');
     return response.data;
 };

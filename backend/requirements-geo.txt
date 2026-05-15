@@ -1,0 +1,9 @@
+# ─── Geo/spatial libraries (moderate install time) ────────────────────────────
+osmnx>=1.7.2
+networkx>=3.0
+geopandas>=0.13.0
+shapely>=2.0.2
+timezonefinder>=6.2.0
+scipy>=1.10.0
+openrouteservice>=2.3.3
+ortools>=9.8

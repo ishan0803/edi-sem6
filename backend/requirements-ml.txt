@@ -1,0 +1,8 @@
+# ─── ML / AI dependencies (heaviest layer — cached aggressively) ──────────────
+# PyTorch CPU-only (~200 MB instead of ~2.5 GB with CUDA)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.1.0
+torch_geometric>=2.4.0
+# NLP
+spacy>=3.7.0
+transformers>=4.36.0

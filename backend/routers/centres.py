@@ -34,7 +34,12 @@ async def add_centre(centre: CentreCreate, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(new_centre)
     
-    await clear_cache()
+    # Auto-seed inventory for new hub (if demo SKUs exist)
+    from services.seed_data import seed_inventory_for_hub
+    await seed_inventory_for_hub(new_id, db)
+    
+    # Clear all coverage cache (unique coverage depends on all centres)
+    await clear_cache(db)
     return new_centre
 
 @router.delete("/{centre_id}")
@@ -47,7 +52,8 @@ async def delete_centre(centre_id: str, db: AsyncSession = Depends(get_db)):
     await db.delete(centre)
     await db.commit()
     
-    await clear_cache()
+    # Clear all coverage cache (unique coverage depends on all centres)
+    await clear_cache(db)
     return {"status": "deleted"}
 
 @router.get("/coverage", response_model=Dict[str, Any])
@@ -59,5 +65,5 @@ async def get_coverage(db: AsyncSession = Depends(get_db)):
         return {"distance": {}, "time": {}}
         
     c_dicts = [{"id": c.id, "name": c.name, "lat": c.lat, "lon": c.lon} for c in centres]
-    coverage = await compute_coverages(c_dicts)
+    coverage = await compute_coverages(c_dicts, db)
     return coverage

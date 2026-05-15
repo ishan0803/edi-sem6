@@ -5,6 +5,9 @@ Generates synthetic 30-day demand history across FulfillmentCentre nodes,
 trains a lightweight 2-layer GCN to predict demand imbalances, and outputs
 inter-store inventory transfer recommendations.
 
+Also provides real-inventory rebalancing using the same GCN architecture,
+weighted by haversine distance for cost-effective transfers.
+
 All heavy compute is offloaded to ThreadPoolExecutor.
 """
 from __future__ import annotations
@@ -15,7 +18,7 @@ from typing import Any, Dict, List
 import numpy as np
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from models import FulfillmentCentre
+from models import FulfillmentCentre, HubInventory, CustomSKU
 
 logger = logging.getLogger(__name__)
 _executor = ThreadPoolExecutor(max_workers=2)
@@ -324,3 +327,228 @@ async def get_synthetic_data() -> Dict:
         if k in store_daily:
             store_daily[k]["total_stock"] += r["stock_qty"]
     return {"daily_aggregates": list(store_daily.values()), "skus": data["skus"]}
+
+
+# ── Real Inventory Rebalancing ───────────────────────────────────────────────
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Compute great-circle distance in km between two lat/lon points."""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _rebalance_with_gnn(hubs: List[Dict], skus: List[Dict], inventory: List[Dict]) -> Dict:
+    """
+    Run GCN on real inventory data and produce cost-effective transfer recommendations.
+    Transfers are weighted by haversine distance between hubs.
+    """
+    n_hubs = len(hubs)
+    n_skus = len(skus)
+    if n_hubs < 2 or n_skus == 0:
+        return {"transfers": [], "metrics": {
+            "stockouts_prevented": 0, "total_units_shifted": 0,
+            "estimated_cost_savings": 0, "network_balance_score": 100.0, "model_loss": None,
+        }, "hub_summaries": []}
+
+    # Build lookup: (hub_id, sku_id) → quantity
+    inv_map: Dict[tuple, int] = {}
+    for inv in inventory:
+        inv_map[(inv["hub_id"], inv["sku_id"])] = inv["quantity"]
+
+    # Compute network-wide average per SKU
+    sku_avg: Dict[str, float] = {}
+    for sku in skus:
+        vals = [inv_map.get((h["id"], sku["id"]), 0) for h in hubs]
+        sku_avg[sku["id"]] = float(np.mean(vals)) if vals else 0.0
+
+    try:
+        import torch
+        import torch.nn.functional as F
+        from torch_geometric.data import Data
+        from torch_geometric.nn import GCNConv
+
+        # Build node features: each node = (hub, sku) pair
+        # Features: [stock_qty, network_avg_for_sku, ratio, hub_lat_norm, hub_lon_norm]
+        node_features = []
+        node_targets = []
+        node_map = {}
+        idx = 0
+        for hi, hub in enumerate(hubs):
+            for si, sku in enumerate(skus):
+                qty = inv_map.get((hub["id"], sku["id"]), 0)
+                avg = sku_avg[sku["id"]]
+                ratio = qty / (avg + 1e-6)
+                node_features.append([float(qty), avg, ratio, hub["lat"] / 90.0, hub["lon"] / 180.0])
+                node_targets.append(avg)  # Target: network average (balanced state)
+                node_map[idx] = {"hub_id": hub["id"], "hub_name": hub["name"],
+                                 "sku_id": sku["id"], "sku_name": sku["name"],
+                                 "lat": hub["lat"], "lon": hub["lon"]}
+                idx += 1
+
+        x = torch.tensor(node_features, dtype=torch.float)
+        y = torch.tensor(node_targets, dtype=torch.float)
+
+        # Build edges: connect same-SKU nodes across hubs (fully connected per SKU)
+        edge_src, edge_dst = [], []
+        for si in range(n_skus):
+            for hi in range(n_hubs):
+                for hj in range(n_hubs):
+                    if hi != hj:
+                        edge_src.append(hi * n_skus + si)
+                        edge_dst.append(hj * n_skus + si)
+        edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)
+        graph_data = Data(x=x, edge_index=edge_index, y=y)
+
+        # GCN model
+        class BalanceGCN(torch.nn.Module):
+            def __init__(self, in_ch, hidden, out_ch):
+                super().__init__()
+                self.conv1 = GCNConv(in_ch, hidden)
+                self.conv2 = GCNConv(hidden, out_ch)
+            def forward(self, data):
+                x = F.relu(self.conv1(data.x, data.edge_index))
+                x = self.conv2(x, data.edge_index)
+                return x.squeeze(-1)
+
+        model = BalanceGCN(5, 32, 1)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+        model.train()
+        for epoch in range(150):
+            optimizer.zero_grad()
+            pred = model(graph_data)
+            loss = F.mse_loss(pred, graph_data.y)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            predicted_ideal = model(graph_data).numpy()
+
+        final_loss = float(loss.item())
+
+    except ImportError:
+        logger.warning("torch_geometric not available, using heuristic for real inventory")
+        # Heuristic fallback: ideal = network average
+        predicted_ideal = np.array([sku_avg[skus[idx % n_skus]["id"]] for idx in range(n_hubs * n_skus)])
+        final_loss = None
+
+    # Pre-compute distance matrix between hubs
+    dist_matrix: Dict[tuple, float] = {}
+    for i, h1 in enumerate(hubs):
+        for j, h2 in enumerate(hubs):
+            if i != j:
+                dist_matrix[(h1["id"], h2["id"])] = _haversine_km(h1["lat"], h1["lon"], h2["lat"], h2["lon"])
+
+    # Generate transfer recommendations
+    transfers = []
+    for si, sku in enumerate(skus):
+        hub_data = []
+        for hi, hub in enumerate(hubs):
+            ni = hi * n_skus + si
+            actual = inv_map.get((hub["id"], sku["id"]), 0)
+            ideal = float(predicted_ideal[ni])
+            surplus = actual - ideal
+            hub_data.append({
+                "hub_id": hub["id"], "hub_name": hub["name"],
+                "actual": actual, "ideal": round(ideal, 1), "surplus": round(surplus, 1),
+                "lat": hub["lat"], "lon": hub["lon"],
+            })
+
+        overstocked = sorted([h for h in hub_data if h["surplus"] > 2], key=lambda x: -x["surplus"])
+        understocked = sorted([h for h in hub_data if h["surplus"] < -2], key=lambda x: x["surplus"])
+
+        for src in overstocked:
+            for dst in understocked:
+                qty = min(src["surplus"], abs(dst["surplus"]))
+                if qty < 1:
+                    continue
+                dist = dist_matrix.get((src["hub_id"], dst["hub_id"]), 999)
+                # Cost: ₹2 per unit per km (simplified logistics cost model)
+                transfer_cost = round(qty * dist * 2.0, 0)
+                # Cost-effectiveness score: higher = better (units moved per rupee)
+                cost_effectiveness = round(qty / (transfer_cost + 1), 4) if transfer_cost > 0 else 999
+
+                transfers.append({
+                    "sku_id": sku["id"], "sku_name": sku["name"],
+                    "from_hub": src["hub_id"], "from_name": src["hub_name"],
+                    "to_hub": dst["hub_id"], "to_name": dst["hub_name"],
+                    "transfer_qty": round(qty),
+                    "distance_km": round(dist, 1),
+                    "estimated_cost": transfer_cost,
+                    "cost_effectiveness": cost_effectiveness,
+                    "priority": "high" if qty > 20 else "medium" if qty > 5 else "low",
+                })
+                # Reduce available surplus/deficit for subsequent matches
+                src["surplus"] -= qty
+                dst["surplus"] += qty
+
+    # Sort by cost-effectiveness (best deals first)
+    transfers.sort(key=lambda t: -t["cost_effectiveness"])
+
+    # Build hub summaries
+    hub_summaries = []
+    for hi, hub in enumerate(hubs):
+        total_actual, total_ideal = 0, 0
+        for si in range(n_skus):
+            ni = hi * n_skus + si
+            actual = inv_map.get((hub["id"], skus[si]["id"]), 0)
+            total_actual += actual
+            total_ideal += float(predicted_ideal[ni])
+        diff = total_actual - total_ideal
+        hub_summaries.append({
+            "hub_id": hub["id"], "hub_name": hub["name"],
+            "total_stock": total_actual,
+            "ideal_stock": round(total_ideal),
+            "health": "balanced" if abs(diff) < total_ideal * 0.15 else
+                      "overstocked" if diff > 0 else "understocked",
+        })
+
+    total_shifted = sum(t["transfer_qty"] for t in transfers)
+    total_cost = sum(t["estimated_cost"] for t in transfers)
+    stockouts = sum(1 for s in hub_summaries if s["health"] == "understocked")
+
+    return {
+        "transfers": transfers[:30],
+        "metrics": {
+            "stockouts_prevented": stockouts,
+            "total_units_shifted": round(total_shifted),
+            "total_transfer_cost": round(total_cost),
+            "network_balance_score": round(100 - (stockouts / max(1, len(hubs)) * 100), 1),
+            "model_loss": round(final_loss, 4) if final_loss else None,
+        },
+        "hub_summaries": hub_summaries,
+    }
+
+
+async def rebalance_real_inventory(db: AsyncSession) -> Dict:
+    """Read real hub inventory from DB and run GNN rebalancing."""
+    # Fetch hubs
+    hub_result = await db.execute(select(FulfillmentCentre))
+    hubs_raw = hub_result.scalars().all()
+    if len(hubs_raw) < 2:
+        return {"error": "Need at least 2 hubs to rebalance. Add more hubs first."}
+
+    hubs = [{"id": h.id, "name": h.name, "lat": h.lat, "lon": h.lon} for h in hubs_raw]
+
+    # Fetch custom SKUs
+    sku_result = await db.execute(select(CustomSKU))
+    skus_raw = sku_result.scalars().all()
+    if not skus_raw:
+        return {"error": "No SKUs defined. Add SKUs to the catalogue first."}
+
+    skus = [{"id": s.id, "name": s.name, "category": s.category, "unit_cost": s.unit_cost} for s in skus_raw]
+
+    # Fetch inventory
+    inv_result = await db.execute(select(HubInventory))
+    inv_raw = inv_result.scalars().all()
+    if not inv_raw:
+        return {"error": "No inventory data. Add stock to hubs first."}
+
+    inventory = [{"hub_id": i.hub_id, "sku_id": i.sku_id, "quantity": i.quantity} for i in inv_raw]
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(_executor, _rebalance_with_gnn, hubs, skus, inventory)
+    return result

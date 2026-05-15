@@ -1,88 +1,135 @@
 """
-Z-Axis Friction Index (ZAFI) Service
-=====================================
-Queries OpenStreetMap building data via OSMnx to estimate vertical-access
-delays (security gates, elevator waits) at the delivery destination.
+Z-Axis Friction Index (ZAFI) Service — Transformer Edition
+==========================================================
+Extracts vertical-access penalties (floor level, building type, security gates)
+directly from the delivery address text using a transformer QA model +
+regex patterns. No external API calls needed.
 
-Results are aggressively cached in Redis using a geohash key derived from
-the destination coordinates so that repeat queries for nearby addresses
-avoid hitting the Overpass API.
+Architecture
+------------
+1. Regex layer  — fast, reliable extraction of floor/level numbers
+2. Transformer layer — HuggingFace QA pipeline (distilbert) for building type
+                       and floor extraction when regex misses
+3. Keyword layer — deterministic building type from known keywords
 
 Penalty Matrix
 --------------
 Building Type    | Security Delay
 -----------------+---------------
-apartment/residential | 120 s
-commercial/office     |  90 s
-house                 |  30 s
-other / unknown       |  60 s
+apartment/tower  | 120 s
+commercial/office|  90 s
+house/villa      |  30 s
+other / unknown  |  60 s
 
-Elevator wait: ``levels × 30 s`` (capped at 10 levels → max 300 s)
+Elevator wait: ``floor × 25 s`` (capped at 15 floors → max 375 s)
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
-import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 _executor = ThreadPoolExecutor(max_workers=2)
 
 # ---------------------------------------------------------------------------
-# Redis setup (optional — degrades gracefully if unavailable)
+# Lazy-loaded transformer model
 # ---------------------------------------------------------------------------
-_redis_client = None
+_qa_pipeline = None
+_qa_load_attempted = False
 
 
-def _get_redis():
-    global _redis_client
-    if _redis_client is None:
-        try:
-            import redis as _redis_mod
-            url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-            _redis_client = _redis_mod.from_url(url, decode_responses=True)
-            _redis_client.ping()
-            logger.info("ZAFI Redis cache connected at %s", url)
-        except Exception as exc:
-            logger.warning("ZAFI Redis unavailable (%s) — running without cache.", exc)
-            _redis_client = "UNAVAILABLE"
-    return _redis_client
-
-
-def _cache_key(lat: float, lon: float) -> str:
-    """Return a Redis key based on a geohash of the coordinates (precision 7 ≈ ±76 m)."""
+def _get_qa_pipeline():
+    """Lazy-load the HuggingFace QA pipeline (distilbert — ~250 MB)."""
+    global _qa_pipeline, _qa_load_attempted
+    if _qa_load_attempted:
+        return _qa_pipeline
+    _qa_load_attempted = True
     try:
-        import geohash2
-        gh = geohash2.encode(lat, lon, precision=7)
-    except ImportError:
-        gh = f"{round(lat, 4)}:{round(lon, 4)}"
-    return f"zafi:{gh}"
+        from transformers import pipeline
+        _qa_pipeline = pipeline(
+            "question-answering",
+            model="distilbert/distilbert-base-cased-distilled-squad",
+            device=-1,  # CPU only
+        )
+        logger.info("ZAFI transformer QA pipeline loaded (distilbert-squad)")
+    except Exception as exc:
+        logger.warning("ZAFI transformer unavailable (%s) — using regex-only mode", exc)
+        _qa_pipeline = None
+    return _qa_pipeline
+
+
+# ---------------------------------------------------------------------------
+# In-memory cache (address hash → result)
+# ---------------------------------------------------------------------------
+_zafi_cache: Dict[str, Dict] = {}
 
 
 # ---------------------------------------------------------------------------
 # Security delay lookup
 # ---------------------------------------------------------------------------
 _SECURITY_DELAYS: Dict[str, int] = {
-    "apartments": 120,
-    "apartment": 120,
-    "residential": 120,
-    "commercial": 90,
-    "office": 90,
-    "retail": 90,
-    "house": 30,
-    "detached": 30,
-    "bungalow": 30,
-    "terrace": 30,
+    "apartment": 120, "apartments": 120, "tower": 120, "highrise": 120,
+    "residential": 120, "complex": 120, "society": 100,
+    "commercial": 90, "office": 90, "mall": 90, "plaza": 90,
+    "retail": 90, "corporate": 90,
+    "house": 30, "villa": 30, "bungalow": 30, "independent": 30,
+    "cottage": 30, "row house": 30,
+    "gated": 100, "gated community": 100,
 }
-_DEFAULT_SECURITY = 60
-_MAX_LEVELS = 10
-_SECONDS_PER_LEVEL = 30
+_DEFAULT_SECURITY = 45
+_MAX_FLOORS = 15
+_SECONDS_PER_FLOOR = 25  # elevator wait + walk per floor
+
+
+# ---------------------------------------------------------------------------
+# Regex patterns for floor/level extraction
+# ---------------------------------------------------------------------------
+_RE_FLOOR_PATTERNS = [
+    # "3rd floor", "floor 5", "5th flr", "Floor #3"
+    re.compile(
+        r"(?:floor|flr|flr\.?)\s*#?\s*(\d{1,3})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(\d{1,3})(?:st|nd|rd|th)\s*(?:floor|flr|flr\.?|storey|story)",
+        re.IGNORECASE,
+    ),
+    # "level 5", "L3", "Level-2"
+    re.compile(
+        r"(?:level|lvl|lv)\s*[-#]?\s*(\d{1,3})",
+        re.IGNORECASE,
+    ),
+    # Flat/unit with implied floor: "Flat 302" → floor 3, "apt 1504" → floor 15
+    re.compile(
+        r"(?:flat|apt|unit|room|no\.?)\s*[-#]?\s*(\d{2,4})\b",
+        re.IGNORECASE,
+    ),
+    # Standalone large number that could be flat: "302," or "1504,"
+    re.compile(
+        r"\b(\d{3,4})\s*[,/]",
+    ),
+]
+
+# Building type keywords
+_BUILDING_TYPE_KEYWORDS = {
+    "apartment": ["apartment", "flat", "apt", "residential complex", "housing society",
+                   "society", "bhk", "1bhk", "2bhk", "3bhk"],
+    "tower": ["tower", "heights", "highrise", "high-rise", "skyscraper", "floors"],
+    "commercial": ["office", "commercial", "business park", "tech park", "corporate",
+                    "co-working", "coworking", "workspace"],
+    "mall": ["mall", "plaza", "shopping", "retail", "market complex"],
+    "house": ["house", "villa", "bungalow", "independent", "row house", "rowhouse",
+              "cottage", "duplex", "penthouse ground"],
+    "gated": ["gated community", "gated", "township", "enclave"],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -92,103 +139,214 @@ _SECONDS_PER_LEVEL = 30
 class ZAFIResult:
     penalty_seconds: int
     building_type: Optional[str]
-    levels: int
+    floor_extracted: int
     security_delay: int
     elevator_delay: int
+    extraction_method: str  # "regex", "transformer", "keyword", "none"
 
     def to_dict(self) -> Dict:
         return asdict(self)
 
 
 # ---------------------------------------------------------------------------
-# Core OSMnx query (CPU + network bound, run in thread pool)
+# Floor extraction from flat/unit number
 # ---------------------------------------------------------------------------
-def _query_building(lat: float, lon: float) -> ZAFIResult:
+def _floor_from_flat_number(flat_num: int) -> int:
+    """Infer floor from Indian flat numbering: 302 → floor 3, 1504 → floor 15."""
+    if flat_num < 100:
+        return 0  # ground floor or unit number
+    s = str(flat_num)
+    if len(s) == 3:
+        return int(s[0])      # 302 → 3
+    elif len(s) == 4:
+        return int(s[:2])     # 1504 → 15
+    return 0
+
+
+def _extract_floor_regex(text: str) -> Tuple[int, bool]:
     """
-    Synchronous call to OSMnx → Overpass API.  Always wrapped by
-    ``run_in_executor`` from the async surface.
+    Extract floor number using regex patterns.
+    Returns (floor_number, is_direct) where is_direct means the match was
+    explicitly a floor reference (not inferred from flat number).
     """
+    # Try direct floor patterns first (patterns 0-2)
+    for i, pat in enumerate(_RE_FLOOR_PATTERNS[:3]):
+        m = pat.search(text)
+        if m:
+            floor = min(int(m.group(1)), _MAX_FLOORS)
+            return floor, True
+
+    # Try flat-number-based inference (patterns 3-4)
+    for pat in _RE_FLOOR_PATTERNS[3:]:
+        m = pat.search(text)
+        if m:
+            flat_num = int(m.group(1))
+            floor = _floor_from_flat_number(flat_num)
+            if floor > 0:
+                return min(floor, _MAX_FLOORS), False
+
+    return 0, False
+
+
+def _extract_building_type_keywords(text: str) -> Optional[str]:
+    """Extract building type using keyword matching."""
+    text_lower = text.lower()
+    for btype, keywords in _BUILDING_TYPE_KEYWORDS.items():
+        for kw in keywords:
+            if kw in text_lower:
+                return btype
+    return None
+
+
+def _extract_with_transformer(text: str) -> Tuple[int, Optional[str]]:
+    """
+    Use the transformer QA pipeline to extract floor and building type
+    from address text. Returns (floor, building_type).
+    """
+    qa = _get_qa_pipeline()
+    if qa is None:
+        return 0, None
+
+    floor = 0
+    btype = None
+
     try:
-        import osmnx as ox
-
-        gdf = ox.features_from_point(
-            (lat, lon),
-            tags={"building": True},
-            dist=50,
+        # Question 1: What floor?
+        floor_answer = qa(
+            question="What floor or level number is the delivery on?",
+            context=text,
         )
+        if floor_answer and floor_answer.get("score", 0) > 0.15:
+            # Extract digits from answer
+            digits = re.findall(r"\d+", floor_answer["answer"])
+            if digits:
+                floor = min(int(digits[0]), _MAX_FLOORS)
+                logger.debug("Transformer floor: %d (score=%.2f, answer='%s')",
+                           floor, floor_answer["score"], floor_answer["answer"])
 
-        if gdf.empty:
-            return ZAFIResult(0, None, 0, 0, 0)
-
-        # Take the nearest building row
-        row = gdf.iloc[0]
-
-        # --- Building type ---
-        btype_raw = str(row.get("building", "yes")).lower().strip()
-        btype = btype_raw if btype_raw != "yes" else None
-
-        # --- Levels ---
-        levels_raw = row.get("building:levels", 0)
-        try:
-            levels = min(int(float(str(levels_raw))), _MAX_LEVELS)
-        except (ValueError, TypeError):
-            levels = 0
-
-        # --- Penalties ---
-        security = _SECURITY_DELAYS.get(btype, _DEFAULT_SECURITY) if btype else 0
-        elevator = levels * _SECONDS_PER_LEVEL
-
-        return ZAFIResult(
-            penalty_seconds=security + elevator,
-            building_type=btype,
-            levels=levels,
-            security_delay=security,
-            elevator_delay=elevator,
+        # Question 2: What type of building?
+        type_answer = qa(
+            question="What type of building is this address in?",
+            context=text,
         )
+        if type_answer and type_answer.get("score", 0) > 0.1:
+            answer_lower = type_answer["answer"].lower().strip()
+            # Map to known types
+            for known_type, keywords in _BUILDING_TYPE_KEYWORDS.items():
+                if answer_lower in keywords or any(kw in answer_lower for kw in keywords):
+                    btype = known_type
+                    break
+            if not btype and answer_lower:
+                # Check against security delays keys
+                for key in _SECURITY_DELAYS:
+                    if key in answer_lower or answer_lower in key:
+                        btype = key
+                        break
+            logger.debug("Transformer building type: %s (score=%.2f, answer='%s')",
+                       btype, type_answer["score"], type_answer["answer"])
 
     except Exception as exc:
-        logger.warning("ZAFI OSMnx query failed for (%.5f, %.5f): %s", lat, lon, exc)
-        return ZAFIResult(0, None, 0, 0, 0)
+        logger.debug("Transformer extraction failed: %s", exc)
+
+    return floor, btype
+
+
+# ---------------------------------------------------------------------------
+# Main analysis (CPU-bound, run in thread pool)
+# ---------------------------------------------------------------------------
+def _analyse_address(address_text: str) -> ZAFIResult:
+    """
+    Synchronous address analysis for ZAFI.
+    Priority: regex > transformer > keyword > default
+    """
+    text = address_text.strip()
+    if not text:
+        return ZAFIResult(0, None, 0, 0, 0, "none")
+
+    method = "none"
+    floor = 0
+    btype = None
+
+    # ── Layer 1: Regex extraction (fast, reliable) ────────────────────────
+    regex_floor, is_direct = _extract_floor_regex(text)
+    keyword_btype = _extract_building_type_keywords(text)
+
+    if regex_floor > 0:
+        floor = regex_floor
+        method = "regex"
+    if keyword_btype:
+        btype = keyword_btype
+        if method == "none":
+            method = "keyword"
+
+    # ── Layer 2: Transformer enhancement (if regex found nothing) ─────────
+    if floor == 0 or btype is None:
+        tx_floor, tx_btype = _extract_with_transformer(text)
+        if floor == 0 and tx_floor > 0:
+            floor = tx_floor
+            method = "transformer"
+        if btype is None and tx_btype:
+            btype = tx_btype
+            if method == "none":
+                method = "transformer"
+
+    # ── Layer 3: Compute penalties ────────────────────────────────────────
+    security = _SECURITY_DELAYS.get(btype, _DEFAULT_SECURITY) if btype else _DEFAULT_SECURITY
+    elevator = floor * _SECONDS_PER_FLOOR
+
+    return ZAFIResult(
+        penalty_seconds=security + elevator,
+        building_type=btype,
+        floor_extracted=floor,
+        security_delay=security,
+        elevator_delay=elevator,
+        extraction_method=method,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Public async API
 # ---------------------------------------------------------------------------
-async def compute_zafi(lat: float, lon: float) -> Dict:
+async def compute_zafi(lat: float, lon: float, address_text: str = "") -> Dict:
     """
-    Compute the Z-Axis Friction Index for the given coordinates.
+    Compute the Z-Axis Friction Index from the address text.
 
-    Checks Redis cache first; on a miss, queries Overpass via OSMnx and
-    stores the result for 24 hours.
+    Uses regex + transformer (distilbert QA) to extract floor number
+    and building type, then calculates delivery friction penalty.
+
+    Parameters
+    ----------
+    lat, lon : float
+        Coordinates (used for cache key)
+    address_text : str
+        The delivery address text to analyse
 
     Returns
     -------
     dict
-        ``{penalty_seconds, building_type, levels, security_delay, elevator_delay}``
+        ``{penalty_seconds, building_type, floor_extracted,
+           security_delay, elevator_delay, extraction_method}``
     """
-    cache_k = _cache_key(lat, lon)
-    rds = _get_redis()
+    # Cache key: hash of address + rounded coords
+    cache_key = hashlib.md5(
+        f"{round(lat, 3)}:{round(lon, 3)}:{address_text.lower().strip()}".encode()
+    ).hexdigest()
 
-    # --- Cache hit ---
-    if rds and rds != "UNAVAILABLE":
-        try:
-            cached = rds.get(cache_k)
-            if cached:
-                logger.debug("ZAFI cache hit for %s", cache_k)
-                return json.loads(cached)
-        except Exception:
-            pass
+    if cache_key in _zafi_cache:
+        return _zafi_cache[cache_key]
 
-    # --- Cache miss → query OSMnx in thread pool ---
     loop = asyncio.get_running_loop()
-    result: ZAFIResult = await loop.run_in_executor(_executor, _query_building, lat, lon)
+    result: ZAFIResult = await loop.run_in_executor(
+        _executor, _analyse_address, address_text
+    )
     payload = result.to_dict()
 
-    # --- Store in cache ---
-    if rds and rds != "UNAVAILABLE":
-        try:
-            rds.setex(cache_k, 86_400, json.dumps(payload))  # 24 h TTL
-        except Exception:
-            pass
+    # Cache the result
+    _zafi_cache[cache_key] = payload
+
+    # Cap cache size
+    if len(_zafi_cache) > 500:
+        oldest = next(iter(_zafi_cache))
+        del _zafi_cache[oldest]
 
     return payload

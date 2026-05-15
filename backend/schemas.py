@@ -86,3 +86,44 @@ class TrainSyntheticResponse(BaseModel):
     skus_simulated: Optional[int] = None
     days_simulated: Optional[int] = None
     error: Optional[str] = None
+
+
+# ── Custom SKU schemas ───────────────────────────────────────────────────────
+
+class SKUCreate(BaseModel):
+    id: str
+    name: str
+    category: str = "general"
+    unit_cost: float = 1.0
+
+class SKUResponse(BaseModel):
+    id: str
+    name: str
+    category: str
+    unit_cost: float
+
+    class Config:
+        from_attributes = True
+
+
+# ── Real Inventory schemas ───────────────────────────────────────────────────
+
+class StockUpsert(BaseModel):
+    hub_id: str
+    sku_id: str
+    quantity: int
+
+class StockResponse(BaseModel):
+    id: int
+    hub_id: str
+    sku_id: str
+    quantity: int
+    hub_name: Optional[str] = None
+    sku_name: Optional[str] = None
+
+class HubInventorySummary(BaseModel):
+    hub_id: str
+    hub_name: str
+    total_skus: int
+    total_quantity: int
+    items: List[StockResponse]

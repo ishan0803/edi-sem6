@@ -7,6 +7,10 @@
     @apply bg-[#030305] text-white selection:bg-blue-500/30;
     overflow-x: hidden;
   }
+  /* Hardware-accelerate common interactive elements */
+  button, a {
+    will-change: transform;
+  }
 }
 
 /* Fix for Leaflet Map Height */
@@ -18,7 +22,7 @@
   background-color: #1f2937;
 }
 
-/* Custom glowing effects */
+/* Custom glowing effects — use GPU compositing */
 .glow-primary {
   box-shadow: 0 0 80px -20px rgba(59, 130, 246, 0.5);
 }
@@ -34,7 +38,8 @@
 }
 
 .glass-panel {
-  @apply bg-white/[0.02] border border-white/[0.05] backdrop-blur-md rounded-2xl;
+  @apply bg-white/[0.02] border border-white/[0.05] rounded-2xl;
+  /* Removed backdrop-blur-md — it's a GPU compositing killer */
 }
 
 .cyber-grid {
@@ -43,4 +48,18 @@
     linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
     linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
   mask-image: radial-gradient(ellipse at center, black 40%, transparent 80%);
+  contain: strict;
+}
+
+/* Smooth scrolling for dashboard panels */
+.overflow-y-auto {
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Reduce motion for users who prefer it */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

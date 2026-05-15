@@ -1,15 +1,25 @@
 """
 City-Tier Traffic Validator & Customer ETA Calculator
 =====================================================
-Adjusts ORS travel times by a city-density scaling factor (Metro vs Tier-2/3)
+Adjusts travel times by a city-density scaling factor (Metro vs Tier-2/3)
 and provides a customer-facing ETA endpoint that finds the nearest active
-store and returns a tier-adjusted estimated delivery time.
+store and returns a realistic estimated delivery time.
 
-City-Tier Factors
------------------
-Metro (Pune, Mumbai, Bangalore, Delhi, …)  : 1.0 – 1.2×
-Tier-2/3 (Sangli, Kolhapur, Nashik, …)     : 0.5 – 0.7×
-Unknown                                      : 0.8× (conservative mid-range)
+ETA Model
+---------
+Total ETA = Preparation Time + Transit Time × Traffic Factor
+
+Where:
+  - Preparation Time = 3-5 minutes (picking + packing in store)
+  - Transit Time = driving time from ORS or haversine estimate
+  - Traffic Factor = city-tier multiplier for congestion
+
+City-Tier Factors (multipliers on transit time)
+-----------------------------------------------
+Metro (Mumbai, Bangalore, Delhi, …)    : 1.3 – 1.6×  (heavy traffic)
+Tier-1 (Pune, Hyderabad, Chennai, …)   : 1.1 – 1.3×  (moderate traffic)
+Tier-2/3 (Sangli, Kolhapur, Nashik, …) : 1.0 – 1.1×  (light traffic)
+Unknown                                 : 1.15× (conservative mid-range)
 """
 
 from __future__ import annotations
@@ -35,32 +45,40 @@ ORS_DIRECTIONS_URL = "https://api.openrouteservice.org/v2/directions/driving-car
 ORS_GEOCODE_URL = "https://api.openrouteservice.org/geocode/reverse"
 
 # ---------------------------------------------------------------------------
-# City-tier configuration (extensible)
+# Preparation time (seconds) — time to pick, pack, and hand off to rider
+# ---------------------------------------------------------------------------
+PREP_TIME_SEC = 180  # 3 minutes base prep time
+
+# ---------------------------------------------------------------------------
+# City-tier configuration — traffic congestion multipliers
+# Higher = more congested = longer delivery
 # ---------------------------------------------------------------------------
 CITY_TIERS: Dict[str, Dict] = {
-    # --- Metros ---
-    "pune":      {"tier": "metro",  "factor": 1.0},
-    "mumbai":    {"tier": "metro",  "factor": 1.1},
-    "bangalore": {"tier": "metro",  "factor": 1.15},
-    "bengaluru": {"tier": "metro",  "factor": 1.15},
-    "delhi":     {"tier": "metro",  "factor": 1.2},
-    "new delhi": {"tier": "metro",  "factor": 1.2},
-    "hyderabad": {"tier": "metro",  "factor": 1.05},
-    "chennai":   {"tier": "metro",  "factor": 1.1},
-    "kolkata":   {"tier": "metro",  "factor": 1.1},
-    # --- Tier 2/3 ---
-    "sangli":    {"tier": "tier2",  "factor": 0.6},
-    "kolhapur":  {"tier": "tier2",  "factor": 0.65},
-    "nashik":    {"tier": "tier2",  "factor": 0.7},
-    "nagpur":    {"tier": "tier2",  "factor": 0.7},
-    "aurangabad":{"tier": "tier2",  "factor": 0.65},
-    "solapur":   {"tier": "tier2",  "factor": 0.6},
-    "jaipur":    {"tier": "tier2",  "factor": 0.75},
-    "lucknow":   {"tier": "tier2",  "factor": 0.7},
-    "indore":    {"tier": "tier2",  "factor": 0.7},
-    "bhopal":    {"tier": "tier2",  "factor": 0.65},
+    # --- Metros (heavy traffic) ---
+    "mumbai":    {"tier": "metro",  "factor": 1.5},
+    "delhi":     {"tier": "metro",  "factor": 1.6},
+    "new delhi": {"tier": "metro",  "factor": 1.6},
+    "bangalore": {"tier": "metro",  "factor": 1.4},
+    "bengaluru": {"tier": "metro",  "factor": 1.4},
+    "kolkata":   {"tier": "metro",  "factor": 1.45},
+    "chennai":   {"tier": "metro",  "factor": 1.35},
+    # --- Tier 1 (moderate traffic) ---
+    "pune":      {"tier": "tier1",  "factor": 1.2},
+    "hyderabad": {"tier": "tier1",  "factor": 1.25},
+    "ahmedabad": {"tier": "tier1",  "factor": 1.2},
+    "jaipur":    {"tier": "tier1",  "factor": 1.15},
+    "lucknow":   {"tier": "tier1",  "factor": 1.15},
+    # --- Tier 2/3 (lighter traffic, but worse roads) ---
+    "sangli":    {"tier": "tier2",  "factor": 1.05},
+    "kolhapur":  {"tier": "tier2",  "factor": 1.05},
+    "nashik":    {"tier": "tier2",  "factor": 1.1},
+    "nagpur":    {"tier": "tier2",  "factor": 1.1},
+    "aurangabad":{"tier": "tier2",  "factor": 1.05},
+    "solapur":   {"tier": "tier2",  "factor": 1.0},
+    "indore":    {"tier": "tier2",  "factor": 1.1},
+    "bhopal":    {"tier": "tier2",  "factor": 1.1},
 }
-DEFAULT_FACTOR = 0.8
+DEFAULT_FACTOR = 1.15
 
 # In-memory reverse-geocode cache  (coord → city_name)
 _city_cache: Dict[str, str] = {}
@@ -83,37 +101,17 @@ def _reverse_geocode_city(lat: float, lon: float) -> Optional[str]:
     """
     Reverse-geocode via ORS to identify the city name.
     Returns lowercase city name or None.
+    Uses centralized rate limiter + cache.
     """
     cache_k = f"{round(lat, 3)}:{round(lon, 3)}"
     if cache_k in _city_cache:
         return _city_cache[cache_k]
 
-    if not ORS_API_KEY:
-        return None
-
-    try:
-        resp = requests.get(
-            ORS_GEOCODE_URL,
-            params={"point.lat": lat, "point.lon": lon, "size": 1},
-            headers={"Authorization": ORS_API_KEY},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        features = resp.json().get("features", [])
-        if features:
-            props = features[0].get("properties", {})
-            city = (
-                props.get("locality")
-                or props.get("county")
-                or props.get("region")
-                or ""
-            ).lower().strip()
-            _city_cache[cache_k] = city
-            return city
-    except Exception as exc:
-        logger.warning("Reverse geocode failed: %s", exc)
-
-    return None
+    from services.ors_limiter import ors_reverse_geocode
+    city = ors_reverse_geocode(lat, lon)
+    if city:
+        _city_cache[cache_k] = city
+    return city
 
 
 def get_tier_factor(lat: float, lon: float) -> Tuple[float, str]:
@@ -144,38 +142,23 @@ def _ors_driving_time(
 ) -> Optional[float]:
     """
     Query ORS Directions API for driving time in seconds between two points.
-    Returns None on failure.
+    Uses centralized rate limiter + cache. Returns None on failure.
+    
+    Fallback: Haversine distance / 20 km/h average urban speed
+    (20 km/h accounts for turns, signals, one-ways in Indian cities)
     """
     if not ORS_API_KEY:
-        # Estimate from haversine: assume 25 km/h average urban speed
         dist = _haversine(src_lat, src_lon, dst_lat, dst_lon)
-        return dist / (25_000 / 3600)  # seconds
+        return dist / (20_000 / 3600)  # 20 km/h → seconds
 
-    try:
-        resp = requests.post(
-            ORS_DIRECTIONS_URL,
-            json={
-                "coordinates": [
-                    [src_lon, src_lat],
-                    [dst_lon, dst_lat],
-                ],
-            },
-            headers={
-                "Authorization": ORS_API_KEY,
-                "Content-Type": "application/json",
-            },
-            timeout=15,
-        )
-        resp.raise_for_status()
-        routes = resp.json().get("routes", [])
-        if routes:
-            return routes[0]["summary"]["duration"]
-    except Exception as exc:
-        logger.warning("ORS directions failed: %s", exc)
+    from services.ors_limiter import ors_directions
+    result = ors_directions(src_lon, src_lat, dst_lon, dst_lat)
+    if result and "duration" in result:
+        return result["duration"]
 
-    # Fallback
+    # Fallback to haversine
     dist = _haversine(src_lat, src_lon, dst_lat, dst_lon)
-    return dist / (25_000 / 3600)
+    return dist / (20_000 / 3600)
 
 
 # ---------------------------------------------------------------------------
@@ -187,13 +170,16 @@ async def customer_eta(
     db: AsyncSession,
 ) -> Dict:
     """
-    Find the nearest active store and return a tier-adjusted ETA.
+    Find the nearest active store and return a realistic tier-adjusted ETA.
 
+    Total ETA = Prep Time + (Transit Time × Traffic Factor)
+    
     Returns
     -------
     dict
         ``{nearest_store_id, nearest_store_name, distance_m,
-           base_transit_sec, tier_factor, tier_label, estimated_time_sec}``
+           base_transit_sec, tier_factor, tier_label, 
+           prep_time_sec, estimated_time_sec}``
     """
     # 1.  Fetch all stores
     result = await db.execute(select(FulfillmentCentre))
@@ -217,9 +203,12 @@ async def customer_eta(
         lat, lon,
     )
 
-    # 4.  Apply tier factor
+    # 4.  Apply tier factor to transit portion only
     factor, tier_label = get_tier_factor(lat, lon)
-    adjusted = base_transit * factor if base_transit else 0
+    transit_adjusted = (base_transit or 0) * factor
+    
+    # 5.  Total ETA = prep + adjusted transit
+    total_eta = PREP_TIME_SEC + transit_adjusted
 
     return {
         "nearest_store_id": nearest.id,
@@ -228,5 +217,6 @@ async def customer_eta(
         "base_transit_sec": round(base_transit, 1) if base_transit else 0,
         "tier_factor": factor,
         "tier_label": tier_label,
-        "estimated_time_sec": round(adjusted, 1),
+        "prep_time_sec": PREP_TIME_SEC,
+        "estimated_time_sec": round(total_eta, 1),
     }

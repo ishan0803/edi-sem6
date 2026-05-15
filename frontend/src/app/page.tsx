@@ -1,7 +1,7 @@
 "use client";
 import { motion, useScroll, useTransform } from "framer-motion";
 import Link from "next/link";
-import { ArrowRight, MapPin, Activity, ShieldAlert, Cpu, Globe2, Network, Brain, Building2, Truck, BarChart3 } from "lucide-react";
+import { ArrowRight, MapPin, Activity, ShieldAlert, Cpu, Globe2, Network, Brain, Building2, Truck } from "lucide-react";
 import { useRef } from "react";
 
 export default function Home() {
@@ -17,10 +17,10 @@ export default function Home() {
   return (
     <div ref={containerRef} className="relative min-h-screen bg-[#030305] text-white selection:bg-blue-500/30">
 
-      {/* 1. Cinematic Background Elements */}
+      {/* 1. Cinematic Background Elements — reduced blur for GPU perf */}
       <div className="fixed inset-0 cyber-grid pointer-events-none z-0" />
-      <div className="fixed top-[-20%] left-[-10%] w-[50vw] h-[50vw] bg-blue-600/10 rounded-full blur-[150px] pointer-events-none mix-blend-screen z-0" />
-      <div className="fixed bottom-[-20%] right-[-10%] w-[60vw] h-[60vw] bg-purple-600/10 rounded-full blur-[150px] pointer-events-none mix-blend-screen z-0" />
+      <div className="fixed top-[-20%] left-[-10%] w-[50vw] h-[50vw] bg-blue-600/10 rounded-full blur-[100px] pointer-events-none mix-blend-screen z-0" style={{ contain: 'layout' }} />
+      <div className="fixed bottom-[-20%] right-[-10%] w-[60vw] h-[60vw] bg-purple-600/10 rounded-full blur-[100px] pointer-events-none mix-blend-screen z-0" style={{ contain: 'layout' }} />
 
       {/* 2. Above-the-fold Hero Section */}
       <main className="relative z-10 flex flex-col items-center justify-center min-h-screen text-center px-6 overflow-hidden">
@@ -87,13 +87,6 @@ export default function Home() {
               <span className="relative z-10 flex items-center gap-2">
                 Launch Engine <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
               </span>
-            </Link>
-            <Link
-              href="/inventory"
-              className="px-8 py-5 glass-panel text-white font-medium hover:bg-white/[0.05] transition-all border-white/10 hover:border-white/20 flex items-center gap-2"
-            >
-              <BarChart3 className="w-5 h-5 text-purple-400" />
-              Inventory Portal
             </Link>
           </motion.div>
         </motion.div>
